@@ -514,40 +514,6 @@ export class Indexer {
   }
 
   /**
-   * Fetch every page of one ledger window from RPC and return all events.
-   * Cursor pages cannot carry `endLedger`, so events at or past `end` are
-   * dropped here; a short page does not prove the range is exhausted, only an
-   * empty page or the range end does.
-   */
-  private async fetchWindow(
-    start: number,
-    end: number,
-    filters: rpc.Api.EventFilter[],
-  ): Promise<rpc.Api.EventResponse[]> {
-    const collected: rpc.Api.EventResponse[] = [];
-    let page = await this.server.getEvents({
-      startLedger: start,
-      endLedger: end,
-      filters,
-      limit: PAGE_LIMIT,
-    });
-
-    for (;;) {
-      let pastEnd = false;
-      for (const raw of page.events ?? []) {
-        if (raw.ledger >= end) {
-          pastEnd = true;
-          break;
-        }
-        collected.push(raw);
-      }
-      if (pastEnd || (page.events ?? []).length === 0 || !page.cursor) break;
-      page = await this.server.getEvents({ cursor: page.cursor, filters, limit: PAGE_LIMIT });
-    }
-    return collected;
-  }
-
-  /**
    * Index ledgers [cursor, min(cursor + batchSize * concurrency, latest)).
    *
    * Up to `INDEXER_FETCH_CONCURRENCY` windows are fetched in parallel, but
@@ -645,8 +611,27 @@ export class Indexer {
       windows.push({ start: s, end: Math.min(s + batchSize, latest) });
     }
 
-    const fetched = await Promise.allSettled(
-      windows.map((w) => this.fetchWindow(w.start, w.end, filters)),
+    // Phase 1: fetch the first RPC page of every window concurrently — this is
+    // what lets INDEXER_FETCH_CONCURRENCY > 1 reduce wall-clock time. Each window
+    // only pre-fetches its first page; subsequent pages are fetched inside the
+    // per-window transaction below, so the DB always holds page N before the
+    // indexer requests page N+1 of the same window.
+    const firstPages = await Promise.allSettled(
+      windows.map(async (w) => {
+        const page = await this.server.getEvents({
+          startLedger: w.start,
+          endLedger: w.end,
+          filters,
+          limit: PAGE_LIMIT,
+        });
+        const events: rpc.Api.EventResponse[] = [];
+        let done = false;
+        for (const raw of page.events ?? []) {
+          if (raw.ledger >= w.end) { done = true; break; }
+          events.push(raw);
+        }
+        return { events, nextPageCursor: done || !page.cursor ? null : page.cursor };
+      }),
     );
     let applied = 0;
     let mismatched = 0;
@@ -655,31 +640,57 @@ export class Indexer {
     let lastSeenCloseTime: number | null = null;
 
     for (let i = 0; i < windows.length; i += 1) {
-      const result = fetched[i]!;
-      if (result.status === "rejected") {
-        failure = result.reason;
+      const fp = firstPages[i]!;
+      if (fp.status === "rejected") {
+        failure = fp.reason;
         break;
       }
-      const rpcEvents = result.value;
       const nextCursor = windows[i]!.end;
+      const { events: firstPageEvents, nextPageCursor: initialPageCursor } = fp.value;
 
       const windowResult = await this.db.transaction(async (storage) => {
         let wApplied = 0;
         let wMismatched = 0;
         let wLastSeenCloseTime: number | null = null;
         const notifications: DecodedEvent[] = [];
+        const allFirstDeliveries = new Set<string>();
+        const allEvents: rpc.Api.EventResponse[] = [...firstPageEvents];
 
-        for (const ledgerEvents of groupByLedger(rpcEvents)) {
-          const firstDeliveries = await this.retainAll(ledgerEvents, storage);
-          for (const raw of ledgerEvents) {
-            if (!firstDeliveries.has(eventIdOf(raw))) continue;
-            const closeTime = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
-            if (closeTime !== null) wLastSeenCloseTime = closeTime;
-            const decoded = decodeEvent(raw);
-            if (!decoded) continue;
-            if ((await this.apply(decoded, storage, notifications)) !== "mismatched") wApplied += 1;
-            else wMismatched += 1;
+        // Retain the first page within the transaction so it is visible to
+        // same-connection reads before the second page is requested.
+        for (const ledgerEvents of groupByLedger(firstPageEvents)) {
+          const fds = await this.retainAll(ledgerEvents, storage);
+          for (const id of fds) allFirstDeliveries.add(id);
+        }
+
+        // Fetch and retain every subsequent page inside the transaction.
+        let pageCursor: string | null = initialPageCursor;
+        while (pageCursor !== null) {
+          const page = await this.server.getEvents({ cursor: pageCursor, filters, limit: PAGE_LIMIT });
+          const pageEvents: rpc.Api.EventResponse[] = [];
+          let done = false;
+          for (const raw of page.events ?? []) {
+            if (raw.ledger >= nextCursor) { done = true; break; }
+            pageEvents.push(raw);
           }
+          for (const ledgerEvents of groupByLedger(pageEvents)) {
+            const fds = await this.retainAll(ledgerEvents, storage);
+            for (const id of fds) allFirstDeliveries.add(id);
+          }
+          allEvents.push(...pageEvents);
+          if (done || pageEvents.length === 0 || !page.cursor) break;
+          pageCursor = page.cursor;
+        }
+
+        // Apply only first deliveries (duplicates excluded by retainAll).
+        for (const raw of allEvents) {
+          if (!allFirstDeliveries.has(eventIdOf(raw))) continue;
+          const closeTime = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
+          if (closeTime !== null) wLastSeenCloseTime = closeTime;
+          const decoded = decodeEvent(raw);
+          if (!decoded) continue;
+          if ((await this.apply(decoded, storage, notifications)) !== "mismatched") wApplied += 1;
+          else wMismatched += 1;
         }
 
         await storage.run(
